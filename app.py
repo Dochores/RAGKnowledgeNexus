@@ -14,11 +14,14 @@ import uuid
 from datetime import datetime
 import asyncio
 import sqlite3
-from typing import Dict
+from typing import Dict, List
 from contextlib import asynccontextmanager
 import urllib.parse
 
-
+from utils.text_splitter import AdvancedTextSplitter
+from utils.retriever import AdvancedRetriever
+from utils.context_builder import ContextBuilder
+from utils.prompt_builder import PromptBuilder
 
 # 创建应用启动上下文管理器
 @asynccontextmanager
@@ -80,31 +83,38 @@ def init_db():
 # 全局变量
 model = None
 index = None
-documents = []
+documents = {}
 document_to_chunks = {}
 chunks_to_document = {}
 all_chunks = []
 client = None
 
 # 文档和会话存储
-uploaded_documents: Dict[str, Dict] = {}  # {id: {name, content, path}}
-chat_sessions: Dict[str, Dict] = {}  # {id: {summary, updated_at, messages}}
+chat_sessions = {}
+
+# 初始化组件
+text_splitter = AdvancedTextSplitter(chunk_size=500, chunk_overlap=50)
+retriever = AdvancedRetriever()
+context_builder = ContextBuilder()
+prompt_builder = PromptBuilder()
 
 # 保存和加载文档数据
 def save_documents():
     # 创建一个可序列化的版本（不包含文件内容以减少文件大小）
     serializable_docs = {}
-    for doc_id, doc_data in uploaded_documents.items():
+    for doc_id, doc_data in documents.items():
         serializable_docs[doc_id] = {
             "name": doc_data["name"],
-            "path": doc_data["path"]
+            "path": doc_data["path"],
+            "chunks": doc_data["chunks"],
+            "metadata": doc_data["metadata"]
         }
     
     with open("docs/documents_index.json", "w", encoding="utf-8") as f:
         json.dump(serializable_docs, f, ensure_ascii=False, indent=2)
 
 def load_documents():
-    global uploaded_documents
+    global documents
     
     index_path = "docs/documents_index.json"
     if not os.path.exists(index_path):
@@ -118,10 +128,11 @@ def load_documents():
         for doc_id, doc_data in serialized_docs.items():
             path = doc_data.get("path")
             if path and os.path.exists(path):
-                uploaded_documents[doc_id] = {
+                documents[doc_id] = {
                     "name": doc_data["name"],
                     "path": path,
-                    "content": f"文件内容已保存到 {path}"  # 不加载实际内容
+                    "chunks": doc_data["chunks"],
+                    "metadata": doc_data["metadata"]
                 }
         
         # 重建索引
@@ -157,7 +168,7 @@ def rebuild_index():
     all_chunks = []
     
     # 处理上传的文档
-    for doc_id, doc_data in uploaded_documents.items():
+    for doc_id, doc_data in documents.items():
         # 获取文档内容
         content = doc_data.get("content", "")
         path = doc_data.get("path", "")
@@ -233,76 +244,61 @@ def retrieve_docs(query, k=3):
     # 获取原始文档详情
     retrieved_docs = []
     for doc_id in retrieved_doc_ids:
-        if doc_id in uploaded_documents:
-            retrieved_docs.append(f"文档: {uploaded_documents[doc_id]['name']}")
+        if doc_id in documents:
+            retrieved_docs.append(f"文档: {documents[doc_id]['name']}")
     
     return retrieved_docs, retrieved_chunks
-
-
 
 # 文档管理 API
 @app.post("/api/upload")
 async def upload_document(file: UploadFile = File(...)):
-    if not file.filename.endswith((".txt", ".pdf", ".docx")):
-        raise HTTPException(status_code=400, detail="仅支持.txt或.pdf或.docx文件")
-    
-    # 确保docs目录存在
-    os.makedirs("docs", exist_ok=True)
-    
-    # 保存文件到docs目录
-    file_path = os.path.join("docs", file.filename)
-    
-    # 检查文件名是否重复，如果重复则添加时间戳
-    if os.path.exists(file_path):
-        filename, extension = os.path.splitext(file.filename)
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        file_path = os.path.join("docs", f"{filename}_{timestamp}{extension}")
-        file_name = f"{filename}_{timestamp}{extension}"
-    else:
-        file_name = file.filename
+    try:
+        content = await file.read()
+        doc_id = str(uuid.uuid4())
         
-    # 读取文件内容
-    content = await file.read()
-    
-    # 保存文件到磁盘
-    with open(file_path, "wb") as f:
-        f.write(content)
-    
-    # 读取文件内容（用于存储在内存中）
-    if file.filename.endswith(".txt"):
-        try:
-            content_text = content.decode("utf-8")
-        except UnicodeDecodeError:
-            content_text = content.decode("gbk", errors="ignore")
-    else:
-        content_text = f"文件内容已保存到 {file_path}"  # 实际需用pdf/docx解析库
-    
-    doc_id = str(uuid.uuid4())
-    uploaded_documents[doc_id] = {
-        "name": file_name,
-        "content": content_text,
-        "path": file_path
-    }
-    
-    # 重建索引
-    rebuild_index()
-    
-    # 保存文档索引
-    save_documents()
-    
-    return {"id": doc_id, "name": file_name}
+        # 保存文件
+        file_path = f"docs/{file.filename}"
+        with open(file_path, "wb") as f:
+            f.write(content)
+        
+        # 读取文件内容
+        if file.filename.endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            # 处理其他文件类型...
+            raise HTTPException(status_code=400, detail="暂不支持该文件类型")
+        
+        # 文档分块
+        chunks = text_splitter.split_text(content)
+        chunk_metadata = [text_splitter.get_chunk_metadata(chunk) for chunk in chunks]
+        
+        # 更新检索器
+        retriever.add_documents(chunks, chunk_metadata)
+        
+        # 保存文档信息
+        documents[doc_id] = {
+            "name": file.filename,
+            "path": file_path,
+            "chunks": chunks,
+            "metadata": chunk_metadata
+        }
+        
+        return {"message": "文档上传成功", "doc_id": doc_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/documents")
 async def list_documents():
-    return [{"id": k, "name": v["name"]} for k, v in uploaded_documents.items()]
+    return [{"id": k, "name": v["name"]} for k, v in documents.items()]
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: str):
-    if doc_id not in uploaded_documents:
+    if doc_id not in documents:
         raise HTTPException(status_code=404, detail="文档不存在")
     
     # 删除文件
-    file_path = uploaded_documents[doc_id].get("path")
+    file_path = documents[doc_id].get("path")
     if file_path and os.path.exists(file_path):
         try:
             os.remove(file_path)
@@ -310,7 +306,7 @@ async def delete_document(doc_id: str):
             print(f"删除文件时出错: {str(e)}")
     
     # 从内存中删除记录
-    del uploaded_documents[doc_id]
+    del documents[doc_id]
     
     # 重建索引
     rebuild_index()
@@ -320,227 +316,49 @@ async def delete_document(doc_id: str):
     
     return {"message": "删除成功"}
 
-
-@app.post("/api/stream")
-async def stream_post(request: Request):
-    try:
-        # 解析请求体中的 JSON 数据
-        req_data = await request.json()
-        query = req_data.get("query")
-        session_id = req_data.get("session_id")  # 获取会话ID
-        web_search = req_data.get("web_search", False)  # 获取联网搜索选项
-        return await process_stream_request(query, session_id, web_search)
-    except Exception as e:
-        error_msg = str(e)
-        print(f"聊天接口错误: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
-
-@app.get("/api/stream")
-async def stream_get(query: str = Query(None), session_id: str = Query(None), web_search: bool = Query(False)):
-    try:
-        if not query:
-            raise HTTPException(status_code=400, detail="Missing query parameter")
-        return await process_stream_request(query, session_id, web_search)
-    except Exception as e:
-        error_msg = str(e)
-        print(f"聊天接口错误: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
-
- 
-# 执行网络搜索
-async def perform_web_search(query: str):
-    try:
-        import requests
-        
-        # 使用Google搜索
-        query = urllib.parse.quote(query)
-        #search_url = f"https://www.google.com/search?q={encoded_query}"
-        api_key = "your api key"
-        search_engine_id = "your search engine id"
-        search_url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={search_engine_id}&q={query}&start=0"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        response = requests.get(search_url, headers=headers, timeout=10)
-        data = response.json()  # Parse JSON response
-      
-        print(f"Google search response: {data}")
-        
-        if response.status_code != 200:
-            return f"搜索失败，状态码: {response.status_code}"
- 
-        return str(data)
+@app.post("/api/chat")
+async def chat(query: str, session_id: str = None):
+    async def stream_response():
+        try:
+            # 检索相关文档
+            retrieved_chunks = retriever.hybrid_search(query, k=3)
             
-    except Exception as e:
-        return f"执行网络搜索时出错: {str(e)}"
-
-async def process_stream_request(query: str, session_id: str = None, web_search: bool = False):
-    print(f"query: {query}, session_id: {session_id}, web_search: {web_search}")
-    # 检查session是否存在
-    conn = sqlite3.connect('chat_history.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM chat_sessions WHERE id = ?", (session_id,))
-    has_session = cursor.fetchone()
-    conn.close()
-    
-    if not has_session:
-        session_id = str(uuid.uuid4())
-    
-    # 构建上下文
-    context_parts = []
-    
-    # 如果启用了网络搜索，添加网络搜索结果
-    if web_search:
-        web_results = await perform_web_search(query)
-        print(f"web_results: {web_results}")
-        context_parts.append(web_results)
-    
-    # 检索相关文档
-    retrieved_docs, retrieved_chunks = retrieve_docs(query)
-    
-    # 添加文档检索结果
-    context_parts.append("相关文档:\n" + "\n".join(retrieved_docs))
-    
-    if retrieved_chunks:
-        chunk_context = "\n\n文档内容片段:\n"
-        for i, (doc_id, chunk) in enumerate(retrieved_chunks):
-            doc_name = "未知文档"
-            if doc_id in uploaded_documents:
-                doc_name = uploaded_documents[doc_id]["name"]
-            chunk_context += f"[文档{i+1}: {doc_name}] {chunk}\n"
-        context_parts.append(chunk_context)
-    else:
-        context_parts.append("\n\n没有找到相关的文档内容。")
-    
-    # 合并上下文
-    context = "\n".join(context_parts)
-    
-    prompt = f"上下文信息:\n{context}\n\n问题: {query}\n请基于上下文信息回答问题:"
-    
-    # 用于保存完整响应
-    full_response = ""
-    
-    # 创建stream响应    
-    async def generate():
-        nonlocal full_response
-        
-        system_message = "你是一个专业的问答助手。"
-        
-        if web_search:
-            system_message += "你拥有联网搜索能力，可以提供最新的信息。"
-        else:
-            system_message += "请仅基于提供的上下文信息回答问题，不要添加任何未在上下文中提及的信息。"
+            # 构建上下文
+            chat_history = chat_sessions.get(session_id, {}).get("messages", []) if session_id else None
+            context = context_builder.build_context(retrieved_chunks, query, chat_history)
             
-        system_message += "如果没有相关信息，请明确告知用户无法回答该问题。"
-        
-        stream = client.chat.completions.create(
-            model="glm-4-plus",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt}
-            ],
-            stream=True
-        )
-        
-        for chunk in stream:
-            if chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_response += content
-                yield f"data: {json.dumps({'content': content, 'session_id': session_id})}\n\n"
-                await asyncio.sleep(0.01)  # 添加小延迟确保流式输出
-                
-            if chunk.choices[0].finish_reason is not None:
-                yield f"data: {json.dumps({'content': '', 'session_id': session_id, 'done': True})}\n\n"
-                break
-                
-        # 响应完成后，将完整会话保存到数据库
-        if has_session:
-            await add_message_to_session(session_id, query, full_response)
-        else:
-            await create_new_chat_session(session_id, query, full_response)
+            # 构建提示词
+            messages = prompt_builder.build_prompt(query, context, chat_history)
             
-    return StreamingResponse(
-            generate(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "Transfer-Encoding": "chunked"
-            }
-        )
-
-# 创建新的聊天会话
-async def create_new_chat_session(session_id, query, response):
-    # 创建会话摘要
-    summary = query[:30] + "..." if len(query) > 30 else query
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    try:
-        conn = sqlite3.connect('chat_history.db')
-        cursor = conn.cursor()
-        
-        # 插入会话记录
-        cursor.execute(
-            "INSERT INTO chat_sessions (id, summary, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (session_id, summary, current_time, current_time)
-        )
-        
-        # 插入用户消息
-        cursor.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, "user", query, current_time)
-        )
-        
-        # 插入机器人响应
-        cursor.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, "bot", response, current_time)
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        print(f"创建新会话 {session_id} 成功")
-        return True
-    except Exception as e:
-        print(f"创建新会话失败: {str(e)}")
-        return False
-
-# 向现有会话添加消息
-async def add_message_to_session(session_id, query, response):
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        conn = sqlite3.connect('chat_history.db')
-        cursor = conn.cursor()
-        
-        # 插入用户消息
-        cursor.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, "user", query, current_time)
-        )
-        
-        # 插入机器人响应
-        cursor.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, "bot", response, current_time)
-        )
-        
-        # 更新会话时间戳，使其保持最新
-        cursor.execute(
-            "UPDATE chat_sessions SET updated_at = ? WHERE id = ?",
-            (current_time, session_id)
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        print(f"向会话 {session_id} 添加消息成功")
-        return True
-    except Exception as e:
-        print(f"向会话添加消息失败: {str(e)}")
-        return False
+            # 模拟AI响应（实际项目中替换为真实的LLM调用）
+            response = f"基于检索到的内容，为您回答问题：{query}\n\n"
+            response += "1. 相关文档：\n"
+            for chunk, score, metadata in retrieved_chunks:
+                response += f"- 相关度 {score:.2f}: {chunk[:100]}...\n"
+            
+            # 流式输出
+            for char in response:
+                yield char.encode("utf-8")
+                await asyncio.sleep(0.05)
+            
+            # 保存会话
+            if not session_id:
+                session_id = str(uuid.uuid4())
+            if session_id not in chat_sessions:
+                chat_sessions[session_id] = {
+                    "summary": query[:30] + "..." if len(query) > 30 else query,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "messages": []
+                }
+            chat_sessions[session_id]["messages"].extend([
+                {"role": "user", "content": query},
+                {"role": "assistant", "content": response}
+            ])
+            
+        except Exception as e:
+            yield f"错误: {str(e)}".encode("utf-8")
+    
+    return StreamingResponse(stream_response(), media_type="text/plain")
 
 # 会话历史记录 API
 @app.get("/api/chat/history")
@@ -629,5 +447,8 @@ def health_check():
 
 # 运行服务
 if __name__ == "__main__":
-    import uvicorn
+    # 确保必要的目录存在
+    os.makedirs("docs", exist_ok=True)
+    
+    # 启动应用
     uvicorn.run(app, host="0.0.0.0", port=8000)
