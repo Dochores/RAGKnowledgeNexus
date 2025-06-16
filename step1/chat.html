@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAG Demo - 对话</title>
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <!-- Vue.js -->
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.2.47/dist/vue.global.prod.js"></script>
+  <!-- Axios for API calls -->
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.4.0/dist/axios.min.js"></script>
+  <style>
+    body {
+      background-color: #f5f5f5;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+    }
+    .sidebar {
+      height: 100vh;
+      width: 250px;
+      background-color: #202123;
+      color: white;
+      position: fixed;
+      top: 0;
+      left: 0;
+      overflow-y: auto;
+      padding: 20px;
+      transition: width 0.3s;
+    }
+    .sidebar.collapsed {
+      width: 60px;
+    }
+    .sidebar.collapsed .sidebar-content {
+      display: none;
+    }
+    .history-item {
+      padding: 10px;
+      margin-bottom: 5px;
+      border-radius: 5px;
+      cursor: pointer;
+      background-color: #343541;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .history-item:hover {
+      background-color: #444654;
+    }
+    .chat-container {
+      margin-left: 250px;
+      max-width: 800px;
+      margin-right: auto;
+      margin-left: auto;
+      padding: 20px;
+      height: calc(100vh - 100px);
+      overflow-y: auto;
+    }
+    .message {
+      margin: 20px 0;
+      display: flex;
+      align-items: flex-start;
+    }
+    .message.user {
+      justify-content: flex-end;
+    }
+    .message-content {
+      max-width: 70%;
+      padding: 10px 15px;
+      border-radius: 10px;
+      line-height: 1.5;
+      position: relative;
+    }
+    .user .message-content {
+      background-color: #007bff;
+      color: white;
+    }
+    .bot .message-content {
+      background-color: #ffffff;
+      color: #333;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
+    .input-container {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 800px;
+      width: 100%;
+      padding: 0 20px;
+    }
+    .input-group {
+      background-color: #ffffff;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+    }
+    .input-group input {
+      border: none;
+      box-shadow: none;
+    }
+    .input-group input:focus {
+      box-shadow: none;
+    }
+    .toggle-btn {
+      background: none;
+      border: none;
+      color: white;
+      font-size: 20px;
+      cursor: pointer;
+    }
+    .mic-btn {
+      transition: background-color 0.2s;
+    }
+    .mic-btn.recording {
+      background-color: #dc3545 !important;
+    }
+    .play-btn {
+      margin-left: 10px;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- 侧边栏 -->
+    <div class="sidebar" :class="{ collapsed: isSidebarCollapsed }">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <button class="toggle-btn" @click="toggleSidebar">
+            {{ isSidebarCollapsed ? '>>' : '<<' }}
+        </button>
+        <div class="d-flex align-items-center">
+          <h5 v-if="!isSidebarCollapsed" class="m-0">历史对话</h5>
+        </div>
+        <button v-if="!isSidebarCollapsed" class="btn btn-sm btn-outline-light " title="新聊天" @click="startNewChat">
+            <i class="bi bi-plus-circle"></i>
+          </button>
+      </div>
+      <div class="sidebar-content">
+        <div v-for="session in chatHistory" :key="session.id" class="history-item" @click="loadSession(session.id)">
+          {{ session.summary }} ({{ session.timestamp }})
+        </div>
+        <a href="documents.html" class="btn btn-outline-light mt-3 w-100">文档管理</a>
+      </div>
+    </div>
+    <!-- 对话区域 -->
+    <div class="chat-container" ref="chatContainer">
+      <div v-for="(msg, index) in messages" :key="index" class="message" :class="{ user: msg.role === 'user', bot: msg.role === 'bot' }">
+        <div class="message-content">
+          <strong>{{ msg.role === 'user' ? '用户' : '助手' }}:</strong> {{ msg.content }}
+          <button v-if="msg.role === 'bot' && msg.content" class="btn btn-sm btn-outline-secondary play-btn" @click="toggleSpeech(msg.content, index)">
+            {{ speakingIndex === index ? '停止' : '播放' }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- 输入框 -->
+    <div class="input-container">
+      <div class="input-group">
+        <input v-model="userInput" @keyup.enter="sendMessage" type="text" class="form-control" placeholder="输入您的问题或点击麦克风...">
+        <button class="btn btn-outline-secondary mic-btn" :class="{ recording: isRecording }" @click="toggleRecording">
+          <i class="bi bi-mic-fill"></i>
+        </button>
+        <button class="btn btn-primary" @click="sendMessage">发送</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+
+    // 全局设置 axios 的 baseURL
+    axios.defaults.baseURL = 'http://localhost:8000';
+    
+    createApp({
+      data() {
+        return {
+          userInput: '',
+          messages: [],
+          chatHistory: [],
+          isSidebarCollapsed: false,
+          isRecording: false,
+          recognition: null,
+          speechSynthesis: window.speechSynthesis,
+          speakingIndex: null, // 当前播放的消息索引
+        };
+      },
+      mounted() {
+        this.fetchChatHistory();
+        this.initSpeechRecognition();
+      },
+      methods: {
+        initSpeechRecognition() {
+          const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (SpeechRecognition) {
+            this.recognition = new SpeechRecognition();
+            this.recognition.lang = 'zh-CN';
+            this.recognition.interimResults = true;
+            this.recognition.continuous = true;  // 改为 true，持续识别
+
+            this.recognition.onresult = (event) => {
+              // 获取最新的识别结果
+              const lastResultIndex = event.results.length - 1;
+              const transcript = event.results[lastResultIndex][0].transcript;
+              this.userInput = transcript;
+              // 已注释掉自动发送逻辑
+            };
+
+            this.recognition.onerror = (event) => {
+              console.error('语音识别错误:', event.error);
+              this.isRecording = false;
+              alert('语音识别失败，请检查麦克风或浏览器支持！');
+            };
+
+            this.recognition.onend = () => {
+              // 只有当用户手动停止时，才会通过 toggleRecording 设置 isRecording = false
+              // 这里不做任何操作，防止自动停止识别
+              if (this.isRecording) {
+                this.recognition.start();  // 自动重新开始识别
+              }
+            };
+          } else {
+            alert('您的浏览器不支持语音识别功能！');
+          }
+        },
+        toggleRecording() {
+          if (!this.recognition) return;
+
+          if (this.isRecording) {
+            this.recognition.stop();
+            this.isRecording = false;
+          } else {
+            this.userInput = '';
+            this.recognition.start();
+            this.isRecording = true;
+          }
+        },
+        toggleSpeech(text, index) {
+          if (this.speakingIndex === index) {
+            this.speechSynthesis.cancel();
+            this.speakingIndex = null;
+          } else {
+            this.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.lang = 'zh-CN';
+            utterance.onend = () => {
+              this.speakingIndex = null;
+            };
+            this.speechSynthesis.speak(utterance);
+            this.speakingIndex = index;
+          }
+        },
+        async fetchChatHistory() {
+          try {
+            const response = await axios.get('api/chat/history');
+            this.chatHistory = response.data;
+          } catch (error) {
+            console.error('获取历史对话失败:', error);
+            alert('获取历史对话失败！');
+          }
+        },
+        async loadSession(sessionId) {
+          try {
+            const response = await axios.get(`api/chat/session/${sessionId}`);
+            this.messages = response.data.messages;
+            this.$nextTick(() => {
+              this.$refs.chatContainer.scrollTop = this.$refs.chatContainer.scrollHeight;
+            });
+          } catch (error) {
+            console.error('加载对话失败:', error);
+            alert('加载对话失败！');
+          }
+        },
+        async sendMessage() {
+          if (!this.userInput.trim()) return;
+
+          this.messages.push({ role: 'user', content: this.userInput });
+          const userMessage = this.userInput;
+          this.userInput = '';
+
+          try {
+            const response = await fetch('http://localhost:8000/api/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ query: userMessage }),
+            });
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let botMessage = '';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              const chunk = decoder.decode(value, { stream: true });
+              botMessage += chunk;
+
+              const lastMessage = this.messages[this.messages.length - 1];
+              if (lastMessage && lastMessage.role === 'bot') {
+                lastMessage.content = botMessage;
+              } else {
+                this.messages.push({ role: 'bot', content: botMessage });
+              }
+
+              this.$nextTick(() => {
+                this.$refs.chatContainer.scrollTop = this.$refs.chatContainer.scrollHeight;
+              });
+            }
+
+            // 自动播放助手的响应
+            const lastMessage = this.messages[this.messages.length - 1];
+            if (lastMessage.role === 'bot') {
+              this.toggleSpeech(lastMessage.content, this.messages.length - 1);
+            }
+
+            this.fetchChatHistory();
+          } catch (error) {
+            console.error('发送消息失败:', error);
+            this.messages.push({ role: 'bot', content: '抱歉，服务器错误！' });
+          }
+        },
+        toggleSidebar() {
+          this.isSidebarCollapsed = !this.isSidebarCollapsed;
+        },
+        startNewChat() {
+          // 清空当前对话
+          this.messages = [];
+          // 关闭当前正在播放的语音
+          this.speechSynthesis.cancel();
+          this.speakingIndex = null;
+        },
+      },
+    }).mount('#app');
+  </script>
+
+  <!-- Bootstrap JS -->
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+  <!-- Bootstrap Icons for mic icon -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css" rel="stylesheet">
+</body>
+</html>

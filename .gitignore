@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 日志
+*.log
+logs/
+
+# 本地配置
+.env
+.env.local
+.env.*.local
+
+# 数据库
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# 模型文件（可能很大）
+local_m3e_model/
+*.bin
+*.model
+*.pkl
+
+# 其他
+.DS_Store
+.coverage
+htmlcov/
+.pytest_cache/
+.hypothesis/ 

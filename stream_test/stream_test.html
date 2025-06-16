@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vue Stream Demo</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body>
+    <div id="app">
+        <input v-model="prompt" placeholder="输入提示词" style="width: 300px; padding: 5px;" />
+        <button @click="startStream" :disabled="isStreaming">开始</button>
+        <p style="white-space: pre-wrap; margin-top: 20px;">{{ output }}</p>
+    </div>
+    <script>
+        const { createApp, ref } = Vue;
+        createApp({
+            setup() {
+                const prompt = ref('你好，请简单介绍一下自己！');
+                const output = ref('');
+                const isStreaming = ref(false);
+
+                const startStream = async () => {
+                    if (isStreaming.value) return;
+                    isStreaming.value = true;
+                    output.value = '';
+                    
+                    try {
+                        // 使用更简单的 EventSource API 处理SSE
+                        const eventSource = new EventSource(`http://localhost:5000/stream?prompt=${encodeURIComponent(prompt.value)}`);
+                        
+                        eventSource.onmessage = (event) => {
+                            if (event.data === '[DONE]') {
+                                eventSource.close();
+                                isStreaming.value = false;
+                                return;
+                            }
+                            
+                            try {
+                                const json = JSON.parse(event.data);
+                                output.value += json.content;
+                            } catch (e) {
+                                console.error('解析数据失败:', e);
+                            }
+                        };
+                        
+                        eventSource.onerror = (error) => {
+                            console.error('SSE错误:', error);
+                            eventSource.close();
+                            isStreaming.value = false;
+                        };
+                    } catch (error) {
+                        console.error('流处理错误:', error);
+                        isStreaming.value = false;
+                    }
+                };
+
+                return { prompt, output, isStreaming, startStream };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
